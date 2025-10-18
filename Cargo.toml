@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1.16", features = ["tokio"] }
-log = "0.4.28"
-socket2 = "0.6.0"
-tokio = { version = "1.47.1", features = ["net", "rt", "sync", "time"] }
+hyper-util = { version = "0", features = ["tokio"] }
+log = "0"
+socket2 = "0"
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }

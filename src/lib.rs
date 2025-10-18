@@ -54,12 +54,12 @@ where
         let service = service.clone();
 
         ls.spawn_local(async move {
-            trace!(
-                "thread {} serving conn from {}",
-                thread::current().name().unwrap_or_default(),
-                remote_addr
-            );
             let s = service_fn(|mut req| async {
+                trace!(
+                    "thread {} serving conn from {}",
+                    thread::current().name().unwrap_or_default(),
+                    remote_addr
+                );
                 req.extensions_mut().insert(remote_addr);
                 service.call(req).await
             });
@@ -106,11 +106,7 @@ where
 
     while let Some(res) = set.join_next().await {
         match res {
-            Ok(r) => {
-                if let Err(e) = r {
-                    return Err(e);
-                }
-            }
+            Ok(r) => r?,
             Err(e) => return Err(Box::new(e)),
         }
     }
