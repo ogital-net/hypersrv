@@ -11,7 +11,7 @@ use hyper::{
     body::{Body, Incoming},
     service::Service,
 };
-use log::trace;
+use log::{debug, trace};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::{net::TcpListener, sync};
@@ -28,7 +28,7 @@ where
     B: Body + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     IOF: Fn(TcpStream, SocketAddr) -> F,
-    F: Future<Output = (I, SocketAddr)>,
+    F: Future<Output = std::io::Result<(I, SocketAddr)>>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
     trace!(
@@ -51,7 +51,13 @@ where
             remote_addr
         );
 
-        let (io, _) = io_fn(stream, remote_addr).await;
+        let (io, ra) = match io_fn(stream, remote_addr).await {
+            Ok(res) => res,
+            Err(e) => {
+                debug!("connection error: {e}");
+                continue;
+            }
+        };
         let service = service.clone();
 
         ls.spawn_local(async move {
@@ -59,9 +65,9 @@ where
                 trace!(
                     "thread {} serving conn from {}",
                     thread::current().name().unwrap_or_default(),
-                    remote_addr
+                    ra
                 );
-                req.extensions_mut().insert(remote_addr);
+                req.extensions_mut().insert(ra);
                 service.call(req).await
             });
             let _ = hyper::server::conn::http1::Builder::new()
@@ -86,7 +92,7 @@ where
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     IOF: Fn() -> IF + Clone + Send + 'static,
     IF: Fn(TcpStream, SocketAddr) -> F,
-    F: Future<Output = (I, SocketAddr)>,
+    F: Future<Output = std::io::Result<(I, SocketAddr)>>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
     let mut set = JoinSet::new();
@@ -167,7 +173,7 @@ mod tests {
             .build()
             .expect("build runtime");
         let ls = tokio::task::LocalSet::new();
-        let io_fn = async |stream, remote_addr| (TokioIo::new(stream), remote_addr);
+        let io_fn = async |stream, remote_addr| Ok((TokioIo::new(stream), remote_addr));
         let service = service_fn(|req: Request<Incoming>| async move {
             Ok::<hyper::Response<String>, Infallible>(Response::new(format!(
                 "Hello World! {} {}",
