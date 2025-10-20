@@ -16,18 +16,19 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::{net::TcpListener, sync};
 
-async fn run<S, B, F, I>(
+async fn run<S, B, IOF, F, I>(
     ls: &tokio::task::LocalSet,
     sa: SocketAddr,
     service: S,
-    io_fn: F,
+    io_fn: IOF,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: Service<Request<Incoming>, Response = Response<B>> + Clone + 'static,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     B: Body + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    F: Fn(TcpStream, SocketAddr) -> (I, SocketAddr),
+    IOF: Fn(TcpStream, SocketAddr) -> F,
+    F: Future<Output = (I, SocketAddr)>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
     trace!(
@@ -50,7 +51,7 @@ where
             remote_addr
         );
 
-        let (io, _) = io_fn(stream, remote_addr);
+        let (io, _) = io_fn(stream, remote_addr).await;
         let service = service.clone();
 
         ls.spawn_local(async move {
@@ -71,7 +72,7 @@ where
     }
 }
 
-pub async fn serve<SF, IOF, S, B, IF, I>(
+pub async fn serve<SF, IOF, S, B, IF, F, I>(
     num_threads: usize,
     listen_addr: SocketAddr,
     service_factory: SF,
@@ -84,7 +85,8 @@ where
     B: Body + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     IOF: Fn() -> IF + Clone + Send + 'static,
-    IF: Fn(TcpStream, SocketAddr) -> (I, SocketAddr),
+    IF: Fn(TcpStream, SocketAddr) -> F,
+    F: Future<Output = (I, SocketAddr)>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
     let mut set = JoinSet::new();
@@ -165,7 +167,7 @@ mod tests {
             .build()
             .expect("build runtime");
         let ls = tokio::task::LocalSet::new();
-        let io_fn = |stream, remote_addr| (TokioIo::new(stream), remote_addr);
+        let io_fn = async |stream, remote_addr| (TokioIo::new(stream), remote_addr);
         let service = service_fn(|req: Request<Incoming>| async move {
             Ok::<hyper::Response<String>, Infallible>(Response::new(format!(
                 "Hello World! {} {}",
@@ -178,7 +180,7 @@ mod tests {
             &rt,
             serve(
                 4,
-                "127.0.0.1:8000".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
                 move || Rc::new(service),
                 move || io_fn,
             ),
