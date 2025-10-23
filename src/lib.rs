@@ -12,9 +12,99 @@ use hyper::{
     service::Service,
 };
 use log::{debug, trace};
+#[cfg(not(feature = "http2"))]
+use log::error;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::{net::TcpListener, sync};
+
+#[cfg(feature = "http2")]
+#[derive(Clone, Copy, Debug)]
+struct LocalExec;
+
+#[cfg(feature = "http2")]
+impl<F> hyper::rt::Executor<F> for LocalExec
+where
+    F: std::future::Future + 'static, // not requiring `Send`
+{
+    fn execute(&self, fut: F) {
+        // This will spawn into the currently running `LocalSet`.
+        tokio::task::spawn_local(fut);
+    }
+}
+
+#[derive(Debug)]
+pub struct AlpnError {
+    protocol: Vec<u8>,
+}
+
+impl std::fmt::Display for AlpnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown ALPN protocol: {}",
+            String::from_utf8_lossy(&self.protocol)
+        )
+    }
+}
+
+impl std::error::Error for AlpnError {}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Alpn {
+    Http10,
+    Http11,
+    Http2,
+    Http3,
+}
+
+impl TryFrom<&[u8]> for Alpn {
+    type Error = AlpnError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        match value {
+            b"http/1.0" => Ok(Alpn::Http10),
+            b"http/1.1" => Ok(Alpn::Http11),
+            b"h2" => Ok(Alpn::Http2),
+            b"h3" => Ok(Alpn::Http3),
+            unknown => Err(AlpnError {
+                protocol: unknown.to_vec(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct ConnectionInfo {
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    alpn: Option<Alpn>,
+}
+
+impl ConnectionInfo {
+    pub fn new(local_addr: SocketAddr, remote_addr: SocketAddr, alpn: Option<&[u8]>) -> Self {
+        Self {
+            local_addr,
+            remote_addr,
+            alpn: alpn.and_then(|p| Alpn::try_from(p).ok()),
+        }
+    }
+
+    /// Returns the local address of the connection.
+    pub fn local_addr(&self) -> &SocketAddr {
+        &self.local_addr
+    }
+
+    /// Returns the remote address of the connection.
+    pub fn remote_addr(&self) -> &SocketAddr {
+        &self.remote_addr
+    }
+
+    /// Returns the ALPN protocol used for the connection, if any.
+    pub fn alpn(&self) -> Option<&Alpn> {
+        self.alpn.as_ref()
+    }
+}
 
 async fn run<S, B, IOF, F, I>(
     ls: &tokio::task::LocalSet,
@@ -28,7 +118,7 @@ where
     B: Body + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     IOF: Fn(TcpStream, SocketAddr) -> F + Clone + 'static,
-    F: Future<Output = std::io::Result<(I, SocketAddr)>>,
+    F: Future<Output = std::io::Result<(I, ConnectionInfo)>>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
     trace!(
@@ -55,19 +145,34 @@ where
         let io_fn = io_fn.clone();
         ls.spawn_local(async move {
             match io_fn(stream, remote_addr).await {
-                Ok((io, ra)) => {
-                    let s = service_fn(|mut req| async {
-                        trace!(
-                            "thread {} serving conn from {}",
-                            thread::current().name().unwrap_or_default(),
-                            ra
-                        );
-                        req.extensions_mut().insert(ra);
-                        service.call(req).await
+                Ok((io, conn_info)) => {
+                    let s = service_fn(|mut req| {
+                        let service = service.clone();
+                        async move {
+                            trace!(
+                                "thread {} serving conn from {}",
+                                thread::current().name().unwrap_or_default(),
+                                conn_info.remote_addr()
+                            );
+                            req.extensions_mut().insert(conn_info);
+                            service.call(req).await
+                        }
                     });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, s)
-                        .await;
+                    let is_h2 = conn_info.alpn().is_some_and(|v| *v == Alpn::Http2);
+
+                    if is_h2 {
+                        #[cfg(feature = "http2")]
+                        let _ = hyper::server::conn::http2::Builder::new(LocalExec)
+                            .serve_connection(io, s)
+                            .await;
+
+                        #[cfg(not(feature = "http2"))]
+                        error!("HTTP2 support not enabled");
+                    } else {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, s)
+                            .await;
+                    }
                     trace!("conn from {} closed", remote_addr);
                 }
                 Err(e) => {
@@ -92,7 +197,7 @@ where
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     IOF: Fn() -> IF + Clone + Send + 'static,
     IF: Fn(TcpStream, SocketAddr) -> F + Clone + 'static,
-    F: Future<Output = std::io::Result<(I, SocketAddr)>>,
+    F: Future<Output = std::io::Result<(I, ConnectionInfo)>>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
     let mut set = JoinSet::new();
@@ -173,7 +278,13 @@ mod tests {
             .build()
             .expect("build runtime");
         let ls = tokio::task::LocalSet::new();
-        let io_fn = async |stream, remote_addr| Ok((TokioIo::new(stream), remote_addr));
+        let io_fn = async |stream: TcpStream, remote_addr| {
+            let local_addr = stream.local_addr()?;
+            Ok((
+                TokioIo::<TcpStream>::new(stream),
+                ConnectionInfo::new(local_addr, remote_addr, None),
+            ))
+        };
         let service = service_fn(|req: Request<Incoming>| async move {
             Ok::<hyper::Response<String>, Infallible>(Response::new(format!(
                 "Hello World! {} {}",

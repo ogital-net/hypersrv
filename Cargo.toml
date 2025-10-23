@@ -3,6 +3,9 @@ name = "hypersrv"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+http2 = ["hyper/http2"]
+
 [dependencies]
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0", features = ["tokio"] }
