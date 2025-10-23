@@ -27,7 +27,7 @@ where
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     B: Body + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    IOF: Fn(TcpStream, SocketAddr) -> F,
+    IOF: Fn(TcpStream, SocketAddr) -> F + Clone + 'static,
     F: Future<Output = std::io::Result<(I, SocketAddr)>>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
@@ -51,29 +51,29 @@ where
             remote_addr
         );
 
-        let (io, ra) = match io_fn(stream, remote_addr).await {
-            Ok(res) => res,
-            Err(e) => {
-                debug!("connection error: {e}");
-                continue;
-            }
-        };
         let service = service.clone();
-
+        let io_fn = io_fn.clone();
         ls.spawn_local(async move {
-            let s = service_fn(|mut req| async {
-                trace!(
-                    "thread {} serving conn from {}",
-                    thread::current().name().unwrap_or_default(),
-                    ra
-                );
-                req.extensions_mut().insert(ra);
-                service.call(req).await
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, s)
-                .await;
-            trace!("conn from {} closed", remote_addr);
+            match io_fn(stream, remote_addr).await {
+                Ok((io, ra)) => {
+                    let s = service_fn(|mut req| async {
+                        trace!(
+                            "thread {} serving conn from {}",
+                            thread::current().name().unwrap_or_default(),
+                            ra
+                        );
+                        req.extensions_mut().insert(ra);
+                        service.call(req).await
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, s)
+                        .await;
+                    trace!("conn from {} closed", remote_addr);
+                }
+                Err(e) => {
+                    debug!("connection error: {e}");
+                }
+            };
         });
     }
 }
@@ -91,7 +91,7 @@ where
     B: Body + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     IOF: Fn() -> IF + Clone + Send + 'static,
-    IF: Fn(TcpStream, SocketAddr) -> F,
+    IF: Fn(TcpStream, SocketAddr) -> F + Clone + 'static,
     F: Future<Output = std::io::Result<(I, SocketAddr)>>,
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
