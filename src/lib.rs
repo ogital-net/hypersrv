@@ -161,6 +161,7 @@ where
                     let is_h2 = conn_info.alpn().is_some_and(|v| *v == Alpn::Http2);
 
                     if is_h2 {
+                        trace!("ALPN protocol 'h2', using HTTP2");
                         #[cfg(feature = "http2")]
                         let _ = hyper::server::conn::http2::Builder::new(LocalExec)
                             .serve_connection(io, s)
